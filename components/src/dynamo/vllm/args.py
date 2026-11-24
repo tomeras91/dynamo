@@ -702,9 +702,34 @@ def create_kv_events_config(
     return None
 
 
+def _vllm_has_lookahead_opt_out() -> bool:
+    """Whether this vLLM's SpeculativeConfig still has ``disable_lookahead_block_hashes``.
+
+    vLLM main removed the opt-out (lookahead block hashes are always on with
+    EAGLE/MTP) and rejects unknown speculative-config keys, so injecting it there
+    makes every KV-event publisher with speculative decoding fail at startup.
+    """
+    from vllm.config import SpeculativeConfig
+
+    fields = getattr(SpeculativeConfig, "__dataclass_fields__", None) or getattr(
+        SpeculativeConfig, "model_fields", {}
+    )
+    return "disable_lookahead_block_hashes" in fields
+
+
 def _keep_legacy_block_hashes(engine_config: AsyncEngineArgs) -> None:
     """Default vLLM's EAGLE/MTP lookahead block hashes off for KV event publishers:
-    Dynamo's KV indexers hash only each block's own tokens."""
+    Dynamo's KV indexers hash only each block's own tokens.
+
+    A vLLM without the opt-out is left alone: its KV events still carry each
+    block's own token_ids, which is what the indexers hash; lookahead only
+    delays when a block is stored."""
+    if not _vllm_has_lookahead_opt_out():
+        logger.info(
+            "vLLM has no disable_lookahead_block_hashes; publishing KV events "
+            "with lookahead block hashes"
+        )
+        return
     spec = engine_config.speculative_config
     if (
         spec is None
