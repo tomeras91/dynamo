@@ -125,8 +125,23 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import CrossAttentionManager
 from vllm.v1.engine.core import EngineCore
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.request import Request, RequestStatus
+
+try:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+except ImportError:
+    # Newer vLLM (KV cache allocation policy moved out of the KV cache specs) has
+    # no per-policy spec classes: every attention group is an AttentionSpec and
+    # its window lives in the group's manager config. Only the benchmark-mode
+    # KV warm-up gate below reads these; treat every attention spec as full
+    # attention and no spec as a finite sliding window there.
+    from vllm.v1.kv_cache_interface import AttentionSpec as FullAttentionSpec
+
+    class SlidingWindowSpec:  # type: ignore[no-redef]
+        """Never matches: newer vLLM has no SlidingWindowSpec class."""
+
+        sliding_window = 0
 
 from dynamo.common.forward_pass_metrics import (
     ForwardPassMetrics,
