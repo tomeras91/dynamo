@@ -11,6 +11,9 @@ use super::{Preset, policy_for_role};
 /// Policy type of the `kvcr` preset, selected under a `worker_selection` role.
 pub const KVCR_POLICY_TYPE: &str = "kvcr";
 
+/// Policy type of the default cost without the zero floor on its prefill term.
+pub const UNCLAMPED_POLICY_TYPE: &str = "dynamo-unclamped-cost-fn";
+
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Parameters {
@@ -139,13 +142,15 @@ impl PolicyParameters {
     }
 }
 
-/// Register the named default and the `kvcr` preset, which take the same parameters.
+/// Register the named default and the `kvcr` and unclamped presets, which take the same
+/// parameters.
 pub(crate) fn register(
     registry: &mut RouterPluginRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
     for (policy_type, preset) in [
         ("dynamo-default-cost-fn", Preset::Default),
         (KVCR_POLICY_TYPE, Preset::Kvcr),
+        (UNCLAMPED_POLICY_TYPE, Preset::Unclamped),
     ] {
         registry.register_worker_selection(
             policy_type,

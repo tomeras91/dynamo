@@ -8,7 +8,7 @@ mod parameters;
 mod picker;
 mod scorer;
 
-pub use parameters::KVCR_POLICY_TYPE;
+pub use parameters::{KVCR_POLICY_TYPE, UNCLAMPED_POLICY_TYPE};
 use parameters::PolicyParameters;
 pub(super) use parameters::register;
 
@@ -25,6 +25,10 @@ pub(crate) enum Preset {
     /// reads `KV_COPY` when the shared-cache multiplier is above 0, so the router commits the
     /// selected worker to that copy.
     Kvcr,
+    /// The default cost without the zero floor on the prefill term
+    /// ([`scorer::PrefillFloor::Unclamped`]): the longest cached prefix wins unless the load
+    /// difference exceeds its credit, instead of a random pick among every worker the floor zeroes.
+    Unclamped,
 }
 
 /// Construct the builtin default from configured policy parameters.
@@ -116,6 +120,7 @@ fn policy_with_rng(
     let scorer = match preset {
         Preset::Default => scorer::build(&parameters, worker_label),
         Preset::Kvcr => kvcr::build(&parameters, worker_label),
+        Preset::Unclamped => scorer::build_unclamped(&parameters, worker_label),
     };
     WorkerSelectionPolicy::new(config, worker_label, vec![scorer], picker)
         .with_exclusive_affinity(true)

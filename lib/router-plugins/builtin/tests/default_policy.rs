@@ -1069,3 +1069,126 @@ fn startup_policy_parameters_match_the_default_factory_for_every_role() {
         }
     }
 }
+
+/// Prefill candidates: worker 0 rank 0 holds the request's freshest copy (9 of 10 blocks), worker 1
+/// rank 0 an older copy (6 blocks), the other ranks nothing. `fresh_load` is worker 0 rank 0's
+/// active prefill tokens; every other rank is idle.
+fn two_copy_request(fresh_load: usize) -> (HashMap<u64, TestWorker>, SchedulingRequest) {
+    let (workers, mut request) = fixture(2, 160);
+    let keys: Vec<WorkerWithDpRank> = request.worker_loads.keys().copied().collect();
+    for worker in keys {
+        let overlap = match (worker.worker_id, worker.dp_rank) {
+            (0, 0) => 9,
+            (1, 0) => 6,
+            _ => 0,
+        };
+        request.overlap.tier_overlap_blocks.device.insert(worker, overlap);
+        request.overlap.tier_overlap_blocks.host_pinned.insert(worker, 0);
+        request.overlap.tier_overlap_blocks.disk.insert(worker, 0);
+        request
+            .overlap
+            .effective_overlap_blocks
+            .insert(worker, overlap as f64);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(worker, overlap * 16);
+        request.worker_loads.insert(
+            worker,
+            WorkerLoadProjection {
+                active_requests: 0,
+                active_prefill_tokens: if (worker.worker_id, worker.dp_rank) == (0, 0) {
+                    fresh_load
+                } else {
+                    0
+                },
+                active_decode_blocks: 0,
+                additional_active_blocks: 0,
+            },
+        );
+    }
+    (workers, request)
+}
+
+fn prefill_policy_of_type(policy_type: &str, credit: f64) -> WorkerSelectionPolicy {
+    let mut registry = default_registry();
+    dynamo_router_policies::register(&mut registry).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        format!(
+            "worker_selection:\n  prefill:\n    type: {policy_type}\n    parameters: {{overlap_score_credit: {credit}}}\n"
+        ),
+    )
+    .unwrap();
+    let config = KvRouterConfig {
+        router_policy_config: Some(file.path().display().to_string()),
+        host_cache_hit_weight: 0.0,
+        disk_cache_hit_weight: 0.0,
+        router_temperature: 0.0,
+        ..Default::default()
+    };
+    let factory = registry.resolve(&config).unwrap().unwrap();
+    factory(
+        &SelectionConfig::from(&config),
+        WorkerType::Prefill,
+        RoutingPartitionRef::new("model", "default"),
+    )
+}
+
+#[test]
+fn unclamped_cost_prefers_the_longest_copy_where_the_default_floor_ties() {
+    let (workers, request) = two_copy_request(0);
+    // The default floors both copy holders at 0 (10 - 4*9 < 0, 10 - 4*6 < 0) and picks at random.
+    let default = prefill_policy_of_type("dynamo-default-cost-fn", 4.0);
+    let mut picked = HashSet::new();
+    for _ in 0..200 {
+        let selected = default
+            .select_worker(selection_input(&workers, &request, 16))
+            .unwrap();
+        picked.insert((selected.worker.worker_id, selected.worker.dp_rank));
+    }
+    assert_eq!(picked, HashSet::from([(0, 0), (1, 0)]));
+    // Without the floor the freshest copy wins every time.
+    let unclamped = prefill_policy_of_type(dynamo_router_policies::UNCLAMPED_POLICY_TYPE, 4.0);
+    for _ in 0..50 {
+        let selected = unclamped
+            .select_worker(selection_input(&workers, &request, 16))
+            .unwrap();
+        assert_eq!((selected.worker.worker_id, selected.worker.dp_rank), (0, 0));
+    }
+}
+
+#[test]
+fn unclamped_cost_moves_only_when_the_backlog_exceeds_the_lost_prefix_credit() {
+    // Moving from the 9-block copy to the 6-block copy loses 3 blocks, worth 4 * 3 = 12 blocks of
+    // backlog (192 tokens at 16 tokens per block). Costs: (A + 160)/16 - 36 vs 160/16 - 24.
+    let policy = prefill_policy_of_type(dynamo_router_policies::UNCLAMPED_POLICY_TYPE, 4.0);
+    for (fresh_load, expected) in [(0, (0, 0)), (176, (0, 0)), (208, (1, 0))] {
+        let (workers, request) = two_copy_request(fresh_load);
+        let selected = policy
+            .select_worker(selection_input(&workers, &request, 16))
+            .unwrap();
+        assert_eq!(
+            (selected.worker.worker_id, selected.worker.dp_rank),
+            expected,
+            "fresh copy load {fresh_load}"
+        );
+    }
+}
+
+#[test]
+fn unclamped_cost_matches_the_default_where_the_floor_does_not_bind() {
+    // With credit 1 the prefill term (A + ISL)/B - overlap is never negative, so both policies
+    // rank every candidate the same way.
+    let (workers, request) = fixture(3, 160);
+    let default = prefill_policy_of_type("dynamo-default-cost-fn", 1.0);
+    let unclamped = prefill_policy_of_type(dynamo_router_policies::UNCLAMPED_POLICY_TYPE, 1.0);
+    let a = default
+        .select_worker(selection_input(&workers, &request, 16))
+        .unwrap();
+    let b = unclamped
+        .select_worker(selection_input(&workers, &request, 16))
+        .unwrap();
+    assert_eq!(a.worker, b.worker);
+}

@@ -17,7 +17,7 @@ mod sticky_min_load;
 mod thunderagent;
 mod two_tier_cost_fn;
 pub use default::{
-    KVCR_POLICY_TYPE, default_factory, default_policy, default_policy_with_rng, kvcr_policy,
+    KVCR_POLICY_TYPE, UNCLAMPED_POLICY_TYPE, default_factory, default_policy, default_policy_with_rng, kvcr_policy,
     startup_policy_parameters,
 };
 

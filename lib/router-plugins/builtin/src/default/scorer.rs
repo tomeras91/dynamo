@@ -12,15 +12,56 @@ pub(super) fn build(
     config: &PolicyParameters,
     worker_label: &'static str,
 ) -> Box<dyn WorkerScorer> {
+    build_with_floor(config, worker_label, PrefillFloor::Zero)
+}
+
+/// [`build`] for the `dynamo-unclamped-cost-fn` preset: the same cost without the zero floor on
+/// the prefill term (see [`PrefillFloor::Unclamped`]).
+pub(super) fn build_unclamped(
+    config: &PolicyParameters,
+    worker_label: &'static str,
+) -> Box<dyn WorkerScorer> {
+    build_with_floor(config, worker_label, PrefillFloor::Unclamped)
+}
+
+fn build_with_floor(
+    config: &PolicyParameters,
+    worker_label: &'static str,
+    floor: PrefillFloor,
+) -> Box<dyn WorkerScorer> {
     match (
         config.decode_active_request_weight != 0.0,
         config.shared_cache_multiplier != 0.0,
     ) {
-        (false, false) => Box::new(DefaultScorer::<false, false>::new(config, worker_label)),
-        (false, true) => Box::new(DefaultScorer::<false, true>::new(config, worker_label)),
-        (true, false) => Box::new(DefaultScorer::<true, false>::new(config, worker_label)),
-        (true, true) => Box::new(DefaultScorer::<true, true>::new(config, worker_label)),
+        (false, false) => {
+            Box::new(DefaultScorer::<false, false>::new(config, worker_label).with_floor(floor))
+        }
+        (false, true) => {
+            Box::new(DefaultScorer::<false, true>::new(config, worker_label).with_floor(floor))
+        }
+        (true, false) => {
+            Box::new(DefaultScorer::<true, false>::new(config, worker_label).with_floor(floor))
+        }
+        (true, true) => {
+            Box::new(DefaultScorer::<true, true>::new(config, worker_label).with_floor(floor))
+        }
     }
+}
+
+/// How the prefill term `raw_blocks - credit` is bounded below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrefillFloor {
+    /// The default: `max(0, raw_blocks - credit)`. With a credit above 1 per block, every worker
+    /// holding more than `1/credit` of the prompt (plus its load) scores exactly 0, so the picker
+    /// chooses among them at random, ignoring both which copy is longest and their loads.
+    Zero,
+    /// No floor: `raw_blocks - credit + bound`, where `bound` is the largest credit this request
+    /// can earn on any worker (every tier's weight times the request's blocks). The shift is the
+    /// same for every candidate, so the ranking is that of the unfloored cost, and it keeps the
+    /// cost non-negative for the taint multiplier. A worker holding a longer prefix keeps its
+    /// advantage, and load moves a request only when the backlog difference exceeds the credit for
+    /// the prefix it would lose.
+    Unclamped,
 }
 
 pub(super) struct DefaultScorer<const REQUEST_COST: bool, const SHARED_CREDIT: bool> {
@@ -32,6 +73,7 @@ pub(super) struct DefaultScorer<const REQUEST_COST: bool, const SHARED_CREDIT: b
     decode_active_request_weight: f64,
     prefill_load_scale: f64,
     is_decode: bool,
+    floor: PrefillFloor,
 }
 
 /// Values shared by every worker score in one selection. Preparation keeps their conversions
@@ -43,6 +85,8 @@ pub(super) struct PreparedRequest {
     overlap_credit: f64,
     needs_decay: bool,
     needs_decode_subtraction: bool,
+    /// `PrefillFloor::Unclamped` only: the request-wide shift that keeps the cost non-negative.
+    credit_bound: f64,
 }
 
 /// Division by a power-of-two integer has an exact reciprocal. Both inputs to this helper
@@ -84,7 +128,13 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
             decode_active_request_weight: config.decode_active_request_weight,
             prefill_load_scale: config.prefill_load_scale,
             is_decode: worker_label == "decode",
+            floor: PrefillFloor::Zero,
         }
+    }
+
+    pub(super) fn with_floor(mut self, floor: PrefillFloor) -> Self {
+        self.floor = floor;
+        self
     }
 }
 
@@ -105,7 +155,18 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
             overlap_credit: self.overlap_score_credit,
             needs_decay: context.tracks_prefill_tokens() && self.overlap_score_credit_decay > 0.0,
             needs_decode_subtraction: self.is_decode && !context.tracks_prefill_tokens(),
+            credit_bound: 0.0,
         };
+        if self.floor == PrefillFloor::Unclamped {
+            // Device, host and disk blocks of this prompt never exceed its blocks, and neither do
+            // the shared-cache blocks, so no worker earns more credit than this.
+            let blocks = context.request_blocks().max(1) as f64;
+            prepared.credit_bound = blocks
+                * (self.overlap_score_credit.max(0.0)
+                    + self.host_cache_hit_weight.max(0.0)
+                    + self.disk_cache_hit_weight.max(0.0)
+                    + self.shared_cache_multiplier.max(0.0));
+        }
         if prepared.needs_decay {
             let mut minimum = usize::MAX;
             for candidate in candidates.iter() {
@@ -183,7 +244,12 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
             } else {
                 context.isl_tokens()
             };
-            let prefill = (prepared.block_size.divide(raw_tokens as f64) - credit).max(0.0);
+            let prefill = match self.floor {
+                PrefillFloor::Zero => (prepared.block_size.divide(raw_tokens as f64) - credit).max(0.0),
+                PrefillFloor::Unclamped => (prepared.block_size.divide(raw_tokens as f64) - credit
+                    + prepared.credit_bound)
+                    .max(0.0),
+            };
             self.prefill_load_scale * prefill + load.decode_cost_blocks() + request_cost
         };
         let cost = logit * candidate.preferred_taint_multiplier().unwrap_or(1.0);
